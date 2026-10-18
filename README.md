@@ -30,6 +30,16 @@ No `sudo` and no pip installation are required.
 
 ## Install
 
+### Quick install with curl
+
+```bash
+curl -fsSLo qs-steam.py https://raw.githubusercontent.com/zarzorr69/qs-steam/main/qs-steam.py && python3 qs-steam.py --install
+```
+
+This downloads the installer to your current directory so you can inspect it before running it. The `--install` option installs the user-level synchronizer and timer (no `sudo` required). You can delete the downloaded `qs-steam.py` afterward.
+
+### Install with Git
+
 ```bash
 git clone https://github.com/zarzorr69/qs-steam.git
 cd qs-steam
