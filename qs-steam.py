@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync installed native/Flatpak Steam and Lutris games into Ryoku/XDG app menus.
+"""Sync locally installed games from multiple launchers into Ryoku/XDG menus.
 
 No third-party packages, root privileges, or edits to game configuration required.
 """
@@ -7,11 +7,15 @@ No third-party packages, root privileges, or edits to game configuration require
 from __future__ import annotations
 
 import argparse
+import configparser
+import hashlib
+import json
 import os
 import re
 import shutil
 import sqlite3
 import time
+from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import subprocess
@@ -312,15 +316,367 @@ def lutris_entries() -> tuple[dict[str, str], list[str], set[str]]:
     return expected, warnings, skip_cleanup
 
 
+
+
+# Optional adapters only read game indexes and never rewrite launcher databases.
+# For all adapters, failure to scan an existing data source preserves existing
+# qs-steam entries for that source rather than destroying working shortcuts.
+
+
+def stable_id(value: object) -> str:
+    """Stable filename-safe ID, tolerant of punctuation and Unicode."""
+    return hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:20]
+
+
+def desktop_exec_argv(args: list[str]) -> str:
+    """Encode argv using freedesktop Exec= quoting (not shell quoting)."""
+    def encode(value: str) -> str:
+        # '%' starts desktop-file field codes, so escape it as '%%'.
+        value = value.replace('%', '%%')
+        if re.search(r'[\s"\\\$`&;|<>*?()#]', value):
+            for character in ('\\', '"', '$', '`'):
+                value = value.replace(character, '\\' + character)
+            return '"' + value + '"'
+        return value
+    return ' '.join(encode(x) for x in args)
+
+
+def xdg_entry(title: str, source: str, command: str, icon: str) -> str:
+    return '\n'.join((
+        '[Desktop Entry]', 'Type=Application',
+        f'Name={desktop_text(title)}',
+        f'GenericName={desktop_text(source)} Game',
+        f'Exec={command}',
+        f'Icon={desktop_text(icon)}',
+        'Categories=Game;', 'Terminal=false', 'StartupNotify=true', ''
+    ))
+
+
+def read_manifest(path: Path):
+    """Read only reasonably-sized JSON indexes, never an entire launcher cache."""
+    if path.stat().st_size > 16 * 1024 * 1024:
+        raise ValueError('Game index exceeds 16 MiB')
+    with path.open('r', encoding='utf-8-sig') as stream:
+        return json.load(stream)
+
+
+def heroic_roots() -> list[tuple[Path, str]]:
+    return [
+        (HOME / '.config/heroic', 'native'),
+        (HOME / '.var/app/com.heroicgameslauncher.hgl/config/heroic', 'flatpak'),
+    ]
+
+
+def heroic_install_rows(document: object, runner: str):
+    """Return (app_id, metadata), supporting Epic/GOG/Amazon manifest shapes."""
+    if runner == 'legendary' and isinstance(document, dict):
+        rows = document.items()
+    elif isinstance(document, list):
+        rows = ((str(item.get('appName') or item.get('id') or item.get('app_name') or ''), item)
+                for item in document if isinstance(item, dict))
+    elif isinstance(document, dict):
+        nested = document.get('installed')
+        if isinstance(nested, list):
+            rows = ((str(item.get('appName') or item.get('id') or item.get('app_name') or ''), item)
+                    for item in nested if isinstance(item, dict))
+        else:
+            rows = ((str(k), v) for k, v in document.items() if isinstance(v, dict))
+    else:
+        return
+    for key, value in rows:
+        if not isinstance(value, dict) or value.get('is_dlc'):
+            continue
+        appid = str(value.get('app_name') or value.get('appName') or value.get('id') or key)
+        location = value.get('install_path') or value.get('installPath') or value.get('path')
+        if not appid or not isinstance(location, str) or not location.strip():
+            continue
+        # Only installed entries with real directories, not owned library entries.
+        if not Path(location).expanduser().is_dir():
+            continue
+        yield appid, value
+
+
+def heroic_art(root: Path, appid: str, entry: dict, runner: str) -> str:
+    candidates: list[Path] = []
+    for key in ('art_square', 'art_cover', 'icon', 'icon_path'):
+        v = entry.get(key)
+        if isinstance(v, str) and v.startswith('/'):
+            candidates.append(Path(v))
+    for base in (root / 'images', root / 'icons', root / 'artwork', root / 'cache/images'):
+        for suffix in ('.png', '.jpg', '.jpeg', '.webp'):
+            candidates.append(base / (appid + suffix))
+    return first_image(candidates) or 'heroic'
+
+
+def heroic_entries() -> tuple[dict[str, str], list[str], set[str]]:
+    expected: dict[str, str] = {}
+    warnings: list[str] = []
+    preserve: set[str] = set()
+    specs = (
+        ('legendary', ('legendaryConfig/legendary/installed.json', 'legendary/installed.json')),
+        ('gog', ('gog_store/installed.json',)),
+        ('nile', ('nile_config/nile/installed.json', 'nile_config/installed.json')),
+    )
+    for root, mode in heroic_roots():
+        # AppImage installs register heroic:// without exposing a 'heroic' binary.
+        launchable = bool(shutil.which('xdg-open'))
+        for runner, relative_paths in specs:
+            prefix = f'{PREFIX}heroic-{mode}-{runner}-'
+            paths = [root / rel for rel in relative_paths]
+            if runner == 'legendary':
+                paths += [HOME / '.config/legendary/installed.json'] if mode == 'native' else [
+                    HOME / '.var/app/com.heroicgameslauncher.hgl/config/legendary/installed.json'
+                ]
+            manifests = [path for path in paths if path.is_file()]
+            if not manifests:
+                continue
+            if not launchable:
+                warnings.append(f'Heroic {mode} manifest exists but xdg-open unavailable')
+                preserve.add(prefix)
+                continue
+            for path in manifests:
+                try:
+                    document = read_manifest(path)
+                    for appid, game in heroic_install_rows(document, runner):
+                        title = str(game.get('title') or game.get('name') or game.get('gameTitle') or appid)
+                        url = f'heroic://launch/{runner}/{quote(appid, safe="")}'
+                        name = f'{prefix}{stable_id(appid)}.desktop'
+                        # xdg-open retains Heroic's own chosen Wine/Proton game settings.
+                        expected[name] = xdg_entry(title, f'Heroic {runner.upper()}',
+                                                  desktop_exec_argv(['xdg-open', url]), heroic_art(root, appid, game, runner))
+                except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+                    warnings.append(f'Cannot read Heroic game index {path}: {error}')
+                    preserve.add(prefix)
+    return expected, warnings, preserve
+
+
+def bottles_command(args: list[str], mode: str):
+    if mode == 'flatpak':
+        return ['flatpak', 'run', '--command=bottles-cli', 'com.usebottles.bottles', *args]
+    return ['bottles-cli', *args]
+
+
+def bottles_json(args: list[str], mode: str):
+    result = subprocess.run(bottles_command(['--json', *args], mode),
+                            capture_output=True, text=True, timeout=8, check=True)
+    return json.loads(result.stdout)
+
+
+def bottles_entries() -> tuple[dict[str, str], list[str], set[str]]:
+    expected: dict[str, str] = {}
+    warnings: list[str] = []
+    preserve: set[str] = set()
+    for mode, present in (
+        ('native', bool(shutil.which('bottles-cli')) and
+         (HOME / '.local/share/bottles').is_dir()),
+        ('flatpak', bool(shutil.which('flatpak')) and
+         (HOME / '.var/app/com.usebottles.bottles').is_dir()),
+    ):
+        prefix = f'{PREFIX}bottles-{mode}-'
+        if not present:
+            continue
+        try:
+            available = bottles_json(['list', 'bottles'], mode)
+            if isinstance(available, dict):
+                available = available.get('bottles', [])
+            if not isinstance(available, list):
+                raise ValueError('Unknown Bottles list format')
+            for bottle in available[:15]:
+                bottle_name = bottle.get('name') if isinstance(bottle, dict) else bottle
+                if not isinstance(bottle_name, str) or not bottle_name:
+                    continue
+                programs = bottles_json(['programs', '-b', bottle_name], mode)
+                if not isinstance(programs, list):
+                    raise ValueError('Unknown Bottles programs format')
+                for program in programs:
+                    if not isinstance(program, dict) or program.get('removed'):
+                        continue
+                    name = program.get('name')
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    # Launch the registered program by name using its own bottle.
+                    argv = bottles_command(['run', '-b', bottle_name, '-p', name], mode)
+                    command = desktop_exec_argv(argv)
+                    image = program.get('icon')
+                    icon = str(Path(image).resolve()) if isinstance(image, str) and Path(image).is_file() else 'com.usebottles.bottles'
+                    ident = stable_id(f'{bottle_name}\0{name}')
+                    expected[f'{prefix}{ident}.desktop'] = xdg_entry(name, f'Bottles ({bottle_name})', command, icon)
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+            warnings.append(f'Bottles {mode} scan failed: {error}')
+            preserve.add(prefix)
+    return expected, warnings, preserve
+
+
+def desktop_directories() -> list[Path]:
+    """Discover user desktop shortcut exports without recursively walking home."""
+    candidates = [HOME / 'Desktop', HOME / 'Bureau', HOME / 'Schreibtisch']
+    dirs_file = HOME / '.config/user-dirs.dirs'
+    if dirs_file.is_file():
+        try:
+            for line in dirs_file.read_text(encoding='utf-8').splitlines():
+                if line.startswith('XDG_DESKTOP_DIR='):
+                    value = line.split('=', 1)[1].strip().strip('"')
+                    value = value.replace('$HOME', str(HOME))
+                    if Path(value).is_absolute():
+                        candidates.append(Path(value))
+        except OSError:
+            pass
+    result, seen = [], set()
+    for p in candidates:
+        if p.is_dir() and path_key(p) not in seen:
+            result.append(p)
+            seen.add(path_key(p))
+    return result
+
+
+def imported_shortcut(path: Path):
+    """Import only known game-launcher commands, not arbitrary Desktop scripts."""
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    with path.open('r', encoding='utf-8-sig') as stream:
+        parser.read_file(stream)
+    if not parser.has_section('Desktop Entry'):
+        return None
+    record = parser['Desktop Entry']
+    if (record.get('Type') != 'Application' or
+        record.get('Hidden', 'false').casefold() == 'true' or
+        record.get('NoDisplay', 'false').casefold() == 'true'):
+        return None
+    cmd = record.get('Exec', '').strip()
+    name = record.get('Name', '').strip()
+    if not cmd or not name:
+        return None
+    # The official Hydra deep link is hydralauncher://run?shop=...&objectId=...
+    # No guessing executables or bypassing the game's selected runtime.
+    low = cmd.lower()
+    sources = (
+        ('hydralauncher://run?', 'Hydra'),
+        ('heroic://launch/', 'Heroic'),
+        ('lutris:rungameid/', 'Lutris'),
+        ('itch://install?', 'itch.io'),
+    )
+    source = next((label for needle, label in sources if needle in low), None)
+    if source is None:
+        return None
+    if source == 'Hydra' and 'objectid=' not in low:
+        return None
+    # Keep the launcher-generated Exec string intact (including its Proton flags).
+    return source, xdg_entry(name, source, cmd, record.get('Icon', source.lower()))
+
+
+def exported_shortcut_entries() -> tuple[dict[str, str], list[str], set[str]]:
+    expected: dict[str, str] = {}
+    warnings: list[str] = []
+    preserve: set[str] = set()
+    for directory in desktop_directories():
+        for path in sorted(directory.glob('*.desktop')):
+            try:
+                if path.stat().st_size > 64 * 1024:
+                    continue
+                found = imported_shortcut(path)
+                if found:
+                    source, entry = found
+                    filename = f'{PREFIX}exported-{source.lower().replace(".", "")}-{stable_id(str(path))}.desktop'
+                    expected[filename] = entry
+            except (OSError, configparser.Error, UnicodeError) as error:
+                warnings.append(f'Could not read game shortcut {path}: {error}')
+                preserve.add(f'{PREFIX}exported-')
+    return expected, warnings, preserve
+
+
+def hydra_entries() -> tuple[dict[str, str], list[str], set[str]]:
+    """Read Hydra's LevelDB when the optional plyvel binding is available.
+
+    Otherwise Hydra-generated desktop shortcuts are imported by the generic
+    adapter. The database is never written to or migrated.
+    """
+    expected: dict[str, str] = {}
+    warnings: list[str] = []
+    preserve: set[str] = set()
+    paths = [
+        HOME / '.config/hydra/hydra-db',
+        HOME / '.config/Hydra/hydra-db',
+        HOME / '.config/hydra-launcher/hydra-db',
+        HOME / '.var/app/gg.hydralauncher.hydra/config/hydra/hydra-db',
+    ]
+    present = [p for p in paths if p.is_dir() and (p / 'CURRENT').exists()]
+    if not present:
+        return expected, warnings, preserve
+    try:
+        import plyvel  # type: ignore  # optional, not part of base install
+    except ImportError:
+        # This is expected on pure-stdlib installations; don't report a sync
+        # failure or remove formerly generated entries.
+        preserve.add(f'{PREFIX}hydra-db-')
+        return expected, warnings, preserve
+    for path in present:
+        try:
+            db = plyvel.DB(str(path), create_if_missing=False)
+            try:
+                # abstract-level encodes games sublevel keys with a prefix.
+                for key, raw in db:
+                    if b'!games!' not in key:
+                        continue
+                    try:
+                        game = json.loads(raw)
+                    except (UnicodeError, ValueError):
+                        continue
+                    if not isinstance(game, dict) or game.get('isDeleted'):
+                        continue
+                    shop, objectid = game.get('shop'), game.get('objectId')
+                    name = game.get('title')
+                    if not all(isinstance(x, str) and x for x in (shop, objectid, name)):
+                        continue
+                    executable = game.get('executablePath')
+                    if (shop != 'launchbox' and
+                        (not isinstance(executable, str) or not Path(executable).is_file())):
+                        continue
+                    url = 'hydralauncher://run?' + urlencode({'shop': shop, 'objectId': objectid})
+                    icon = 'hydra'
+                    asset_dir = path.parent / 'Assets' / f'{shop}-{objectid}'
+                    candidates = []
+                    for item in ('cover.jpg', 'icon.png', 'hero.jpg', 'library.jpg'):
+                        candidates.append(asset_dir / item)
+                    icon = first_image(candidates) or icon
+                    filename = f'{PREFIX}hydra-db-{stable_id(shop + ":" + objectid)}.desktop'
+                    expected[filename] = xdg_entry(name, 'Hydra', desktop_exec_argv(['xdg-open', url]), icon)
+            finally:
+                db.close()
+        except Exception as error:
+            # Different plyvel builds expose distinct DB/lock exceptions.
+            warnings.append(f'Hydra database {path} is currently unavailable: {error}')
+            preserve.add(f'{PREFIX}hydra-db-')
+    return expected, warnings, preserve
+
+
+def scan_game_launchers(allow_download: bool = True) -> tuple[dict[str, str], list[str], set[str], dict[str, int]]:
+    result: dict[str, str] = {}
+    warnings: list[str] = []
+    preserve: set[str] = set()
+    totals: dict[str, int] = {}
+    for name, scanner in (
+        ('Steam', lambda: (*steam_entries(allow_download=allow_download), set())),
+        ('Lutris', lutris_entries),
+        ('Heroic', heroic_entries),
+        ('Bottles', bottles_entries),
+        ('Hydra', hydra_entries),
+        ('Desktop exports', exported_shortcut_entries),
+    ):
+        entries, messages, kept = scanner()
+        result.update(entries)
+        warnings.extend(messages)
+        preserve.update(kept)
+        totals[name] = len(entries)
+        if name == 'Steam' and messages and not entries:
+            preserve.add(f'{PREFIX}steam-')
+    return result, warnings, preserve, totals
+
+
 def sync(dry_run: bool = False) -> int:
     global art_download_count
     art_download_count = 0
-    steam, steam_warnings = steam_entries(allow_download=not dry_run)
-    lutris, lutris_warnings, skip_cleanup = lutris_entries()
-    expected = {**steam, **lutris}
-    warnings = steam_warnings + lutris_warnings
-    if steam_warnings and not steam:
-        skip_cleanup.add(f'{PREFIX}steam-')
+    # Dry runs must never download artwork.
+    expected, warnings, skip_cleanup, totals = scan_game_launchers(allow_download=not dry_run)
     if not dry_run:
         APP_DIR.mkdir(parents=True, exist_ok=True)
     changed = 0
@@ -355,17 +711,17 @@ def sync(dry_run: bool = False) -> int:
                     warnings.append(f'Failed to remove {old}: {error}')
                     continue
             changed += 1
-    print(f'Steam: {len(steam)} | Lutris: {len(lutris)} | Changes: {changed}')
+    print(' | '.join(f'{name}: {count}' for name, count in totals.items()) + f' | Changes: {changed}')
     for warning in sorted(set(warnings)):
         print(f'Warning: {warning}', file=sys.stderr)
-    if not steam and not lutris:
-        print('No launchable installed games found (check your Steam libraries / Lutris database).')
+    if not expected:
+        print('No launchable games found. Verify installed game libraries or export game desktop shortcuts.')
     return 0 if not warnings else 1
 
 
 def unit_text() -> tuple[str, str]:
     service = '''[Unit]
-Description=Synchronize Steam and Lutris games into Ryoku app launcher
+Description=Synchronize games from launchers into Ryoku app launcher
 
 [Service]
 Type=oneshot
